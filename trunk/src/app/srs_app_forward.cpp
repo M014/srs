@@ -181,15 +181,17 @@ srs_error_t SrsForwarder::cycle()
     srs_error_t err = srs_success;
     
     while (true) {
+        // We always check status first.
+        // @see https://github.com/ossrs/srs/issues/1634#issuecomment-597571561
+        if ((err = trd->pull()) != srs_success) {
+            return srs_error_wrap(err, "forwarder");
+        }
+
         if ((err = do_cycle()) != srs_success) {
             srs_warn("Forwarder: Ignore error, %s", srs_error_desc(err).c_str());
             srs_freep(err);
         }
-        
-        if ((err = trd->pull()) != srs_success) {
-            return srs_error_wrap(err, "forwarder");
-        }
-    
+
         srs_usleep(SRS_FORWARDER_CIMS);
     }
     
@@ -220,8 +222,11 @@ srs_error_t SrsForwarder::do_cycle()
     if ((err = sdk->connect()) != srs_success) {
         return srs_error_wrap(err, "sdk connect url=%s, cto=%dms, sto=%dms.", url.c_str(), srsu2msi(cto), srsu2msi(sto));
     }
-    
-    if ((err = sdk->publish(_srs_config->get_chunk_size(req->vhost))) != srs_success) {
+
+    // For RTMP client, we pass the vhost in tcUrl when connecting,
+    // so we publish without vhost in stream.
+    string stream;
+    if ((err = sdk->publish(_srs_config->get_chunk_size(req->vhost), false, &stream)) != srs_success) {
         return srs_error_wrap(err, "sdk publish");
     }
     
@@ -232,6 +237,8 @@ srs_error_t SrsForwarder::do_cycle()
     if ((err = forward()) != srs_success) {
         return srs_error_wrap(err, "forward");
     }
+
+    srs_trace("forward publish url %s, stream=%s%s as %s", url.c_str(), req->stream.c_str(), req->param.c_str(), stream.c_str());
     
     return err;
 }

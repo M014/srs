@@ -30,6 +30,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <algorithm>
+#ifndef SRS_AUTO_OSX
+#include <sys/inotify.h>
+#endif
 using namespace std;
 
 #include <srs_kernel_log.hpp>
@@ -51,6 +54,7 @@ using namespace std;
 #include <srs_kernel_consts.hpp>
 #include <srs_app_thread.hpp>
 #include <srs_app_coworkers.hpp>
+#include <srs_app_latest_version.hpp>
 
 // system interval in srs_utime_t,
 // all resolution times should be times togother,
@@ -457,6 +461,151 @@ void SrsSignalManager::sig_catcher(int signo)
     errno = err;
 }
 
+// Whether we are in docker, defined in main module.
+extern bool _srs_in_docker;
+
+SrsInotifyWorker::SrsInotifyWorker(SrsServer* s)
+{
+    server = s;
+    trd = new SrsSTCoroutine("inotify", this);
+    inotify_fd = NULL;
+}
+
+SrsInotifyWorker::~SrsInotifyWorker()
+{
+    srs_freep(trd);
+    srs_close_stfd(inotify_fd);
+}
+
+srs_error_t SrsInotifyWorker::start()
+{
+    srs_error_t err = srs_success;
+
+#ifndef SRS_AUTO_OSX
+    // Whether enable auto reload config.
+    bool auto_reload = _srs_config->inotify_auto_reload();
+    if (!auto_reload && _srs_in_docker && _srs_config->auto_reload_for_docker()) {
+        srs_warn("enable auto reload for docker");
+        auto_reload = true;
+    }
+
+    if (!auto_reload) {
+        return err;
+    }
+
+    // Create inotify to watch config file.
+    int fd = ::inotify_init1(IN_NONBLOCK);
+    if (fd < 0) {
+        return srs_error_new(ERROR_INOTIFY_CREATE, "create inotify");
+    }
+
+    // Open as stfd to read by ST.
+    if ((inotify_fd = srs_netfd_open(fd)) == NULL) {
+        ::close(fd);
+        return srs_error_new(ERROR_INOTIFY_OPENFD, "open fd=%d", fd);
+    }
+
+    if (((err = srs_fd_closeexec(fd))) != srs_success) {
+        return srs_error_new(ERROR_INOTIFY_OPENFD, "closeexec fd=%d", fd);
+    }
+
+    // /* the following are legal, implemented events that user-space can watch for */
+    // #define IN_ACCESS               0x00000001      /* File was accessed */
+    // #define IN_MODIFY               0x00000002      /* File was modified */
+    // #define IN_ATTRIB               0x00000004      /* Metadata changed */
+    // #define IN_CLOSE_WRITE          0x00000008      /* Writtable file was closed */
+    // #define IN_CLOSE_NOWRITE        0x00000010      /* Unwrittable file closed */
+    // #define IN_OPEN                 0x00000020      /* File was opened */
+    // #define IN_MOVED_FROM           0x00000040      /* File was moved from X */
+    // #define IN_MOVED_TO             0x00000080      /* File was moved to Y */
+    // #define IN_CREATE               0x00000100      /* Subfile was created */
+    // #define IN_DELETE               0x00000200      /* Subfile was deleted */
+    // #define IN_DELETE_SELF          0x00000400      /* Self was deleted */
+    // #define IN_MOVE_SELF            0x00000800      /* Self was moved */
+    //
+    // /* the following are legal events.  they are sent as needed to any watch */
+    // #define IN_UNMOUNT              0x00002000      /* Backing fs was unmounted */
+    // #define IN_Q_OVERFLOW           0x00004000      /* Event queued overflowed */
+    // #define IN_IGNORED              0x00008000      /* File was ignored */
+    //
+    // /* helper events */
+    // #define IN_CLOSE                (IN_CLOSE_WRITE | IN_CLOSE_NOWRITE) /* close */
+    // #define IN_MOVE                 (IN_MOVED_FROM | IN_MOVED_TO) /* moves */
+    //
+    // /* special flags */
+    // #define IN_ONLYDIR              0x01000000      /* only watch the path if it is a directory */
+    // #define IN_DONT_FOLLOW          0x02000000      /* don't follow a sym link */
+    // #define IN_EXCL_UNLINK          0x04000000      /* exclude events on unlinked objects */
+    // #define IN_MASK_ADD             0x20000000      /* add to the mask of an already existing watch */
+    // #define IN_ISDIR                0x40000000      /* event occurred against dir */
+    // #define IN_ONESHOT              0x80000000      /* only send event once */
+
+    // Watch the config directory events.
+    string config_dir = srs_path_dirname(_srs_config->config());
+    uint32_t mask = IN_MODIFY | IN_CREATE | IN_MOVED_TO; int watch_conf = 0;
+    if ((watch_conf = ::inotify_add_watch(fd, config_dir.c_str(), mask)) < 0) {
+        return srs_error_new(ERROR_INOTIFY_WATCH, "watch file=%s, fd=%d, watch=%d, mask=%#x",
+            config_dir.c_str(), fd, watch_conf, mask);
+    }
+    srs_trace("auto reload watching fd=%d, watch=%d, file=%s", fd, watch_conf, config_dir.c_str());
+
+    if ((err = trd->start()) != srs_success) {
+        return srs_error_wrap(err, "inotify");
+    }
+#endif
+
+    return err;
+}
+
+srs_error_t SrsInotifyWorker::cycle()
+{
+    srs_error_t err = srs_success;
+
+#ifndef SRS_AUTO_OSX
+    string config_path = _srs_config->config();
+    string config_file = srs_path_basename(config_path);
+    string k8s_file = "..data";
+
+    while (true) {
+        char buf[4096];
+        ssize_t nn = srs_read(inotify_fd, buf, (size_t)sizeof(buf), SRS_UTIME_NO_TIMEOUT);
+        if (nn < 0) {
+            srs_warn("inotify ignore read failed, nn=%d", (int)nn);
+            break;
+        }
+
+        // Whether config file changed.
+        bool do_reload = false;
+
+        // Parse all inotify events.
+        inotify_event* ie = NULL;
+        for (char* ptr = buf; ptr < buf + nn; ptr += sizeof(inotify_event) + ie->len) {
+            ie = (inotify_event*)ptr;
+
+            if (!ie->len || !ie->name) {
+                continue;
+            }
+
+            string name = ie->name;
+            if ((name == k8s_file || name == config_file) && ie->mask & (IN_MODIFY|IN_CREATE|IN_MOVED_TO)) {
+                do_reload = true;
+            }
+
+            srs_trace("inotify event wd=%d, mask=%#x, len=%d, name=%s, reload=%d", ie->wd, ie->mask, ie->len, ie->name, do_reload);
+        }
+
+        // Notify server to do reload.
+        if (do_reload && srs_path_exists(config_path)) {
+            server->on_signal(SRS_SIGNAL_RELOAD);
+        }
+
+        srs_usleep(3000 * SRS_UTIME_MILLISECONDS);
+    }
+#endif
+
+    return err;
+}
+
 ISrsServerCycle::ISrsServerCycle()
 {
 }
@@ -475,6 +624,7 @@ SrsServer::SrsServer()
     pid_fd = -1;
     
     signal_manager = new SrsSignalManager(this);
+    latest_version_ = new SrsLatestVersion();
     conn_manager = new SrsCoroutineManager();
     
     handler = NULL;
@@ -511,6 +661,7 @@ void SrsServer::destroy()
     }
     
     srs_freep(signal_manager);
+    srs_freep(latest_version_);
     srs_freep(conn_manager);
 }
 
@@ -554,9 +705,11 @@ void SrsServer::gracefully_dispose()
     close_listeners(SrsListenerMpegTsOverUdp);
     close_listeners(SrsListenerRtsp);
     close_listeners(SrsListenerFlv);
+    srs_trace("listeners closed");
 
     // Fast stop to notify FFMPEG to quit, wait for a while then fast kill.
     ingester->stop();
+    srs_trace("ingesters stopped");
 
     // Wait for connections to quit.
     // While gracefully quiting, user can requires SRS to fast quit.
@@ -572,6 +725,7 @@ void SrsServer::gracefully_dispose()
 
     // dispose the source for hls and dvr.
     _srs_sources->dispose();
+    srs_trace("source disposed");
 
 #ifdef SRS_AUTO_MEM_WATCH
     srs_memory_report();
@@ -619,18 +773,6 @@ srs_error_t SrsServer::initialize_st()
         return srs_error_wrap(err, "initialize st failed");
     }
     
-    // @remark, st alloc segment use mmap, which only support 32757 threads,
-    // if need to support more, for instance, 100k threads, define the macro MALLOC_STACK.
-    // TODO: FIXME: maybe can use "sysctl vm.max_map_count" to refine.
-#define __MMAP_MAX_CONNECTIONS 32756
-    if (_srs_config->get_max_connections() > __MMAP_MAX_CONNECTIONS) {
-        srs_error("st mmap for stack allocation must <= %d threads, "
-                  "@see Makefile of st for MALLOC_STACK, please build st manually by "
-                  "\"make EXTRA_CFLAGS=-DMALLOC_STACK linux-debug\"", __MMAP_MAX_CONNECTIONS);
-        return srs_error_new(ERROR_ST_EXCEED_THREADS, "%d exceed max %d threads",
-            _srs_config->get_max_connections(), __MMAP_MAX_CONNECTIONS);
-    }
-    
     // set current log id.
     _srs_context->generate_id();
     
@@ -648,7 +790,18 @@ srs_error_t SrsServer::initialize_st()
 
 srs_error_t SrsServer::initialize_signal()
 {
-    return signal_manager->initialize();
+    srs_error_t err = srs_success;
+
+    if ((err = signal_manager->initialize()) != srs_success) {
+        return srs_error_wrap(err, "init signal manager");
+    }
+
+    // Start the version query coroutine.
+    if ((err = latest_version_->start()) != srs_success) {
+        return srs_error_wrap(err, "start version query");
+    }
+
+    return err;
 }
 
 srs_error_t SrsServer::acquire_pid_file()
@@ -846,7 +999,16 @@ srs_error_t SrsServer::ingest()
 
 srs_error_t SrsServer::cycle()
 {
-    srs_error_t err = do_cycle();
+    srs_error_t err = srs_success;
+
+    // Start the inotify auto reload by watching config file.
+    SrsInotifyWorker inotify(this);
+    if ((err = inotify.start()) != srs_success) {
+        return srs_error_wrap(err, "start inotify");
+    }
+
+    // Do server main cycle.
+     err = do_cycle();
     
 #ifdef SRS_AUTO_GPERF_MC
     destroy();
@@ -889,6 +1051,7 @@ srs_error_t SrsServer::cycle()
 void SrsServer::on_signal(int signo)
 {
     if (signo == SRS_SIGNAL_RELOAD) {
+        srs_trace("reload config, signo=%d", signo);
         signal_reload = true;
         return;
     }
@@ -896,7 +1059,7 @@ void SrsServer::on_signal(int signo)
 #ifndef SRS_AUTO_GPERF_MC
     if (signo == SRS_SIGNAL_REOPEN_LOG) {
         _srs_log->reopen();
-        srs_warn("reopen log file");
+        srs_warn("reopen log file, signo=%d", signo);
         return;
     }
 #endif
@@ -904,7 +1067,7 @@ void SrsServer::on_signal(int signo)
 #ifdef SRS_AUTO_GPERF_MC
     if (signo == SRS_SIGNAL_REOPEN_LOG) {
         signal_gmc_stop = true;
-        srs_warn("for gmc, the SIGUSR1 used as SIGINT");
+        srs_warn("for gmc, the SIGUSR1 used as SIGINT, signo=%d", signo);
         return;
     }
 #endif
@@ -916,7 +1079,7 @@ void SrsServer::on_signal(int signo)
     
     if (signo == SIGINT) {
 #ifdef SRS_AUTO_GPERF_MC
-        srs_trace("gmc is on, main cycle will terminate normally.");
+        srs_trace("gmc is on, main cycle will terminate normally, signo=%d", signo);
         signal_gmc_stop = true;
 #else
         #ifdef SRS_AUTO_MEM_WATCH
@@ -1328,7 +1491,7 @@ void SrsServer::remove(ISrsConnection* c)
     
     SrsStatistic* stat = SrsStatistic::instance();
     stat->kbps_add_delta(conn);
-    stat->on_disconnect(conn->srs_id());
+    stat->on_disconnect(srs_int2str(conn->srs_id()));
     
     // use manager to free it async.
     conn_manager->remove(c);

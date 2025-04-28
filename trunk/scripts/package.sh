@@ -16,6 +16,7 @@ PI=NO
 MIPS=NO
 #
 EMBEDED=NO
+JOBS=1
 
 ##################################################################################
 ##################################################################################
@@ -25,8 +26,8 @@ for option
 do
     case "$option" in
         -*=*) 
-            value=`echo "$option" | sed -e 's|[-_a-zA-Z0-9/]*=||'` 
-            option=`echo "$option" | sed -e 's|=[-_a-zA-Z0-9/]*||'`
+            value=`echo "$option" | sed -e 's|[-_a-zA-Z0-9/]*=||'`
+            option=`echo "$option" | sed -e 's|=[-_a-zA-Z0-9/~]*||'`
         ;;
            *) value="" ;;
     esac
@@ -39,6 +40,7 @@ do
         --mips)                         MIPS=YES                  ;;
         --arm)                          ARM=YES                   ;;
         --pi)                           PI=YES                    ;;
+        --jobs)                         JOBS=$value               ;;
 
         *)
             echo "$0: error: invalid option \"$option\", @see $0 --help"
@@ -56,6 +58,9 @@ if [ $help = yes ]; then
   --mips                   for mips cross-build platform, configure/make/package.
   --pi                     for pi platform, configure/make/package.
   --x86-64                 alias for --x86-x64.
+  --jobs                   Set the configure and make jobs.
+
+  --console                The path for https://github.com/ossrs/srs-console
 END
     exit 0
 fi
@@ -113,26 +118,26 @@ ok_msg "real os is ${os_name}-${os_major_version} ${os_release} ${os_machine}"
 
 # build srs
 # @see https://github.com/ossrs/srs/wiki/v1_CN_Build
-ok_msg "start build srs"
+ok_msg "start build srs, ARM: $ARM, MIPS: $MIPS, PI: $PI, X86_64: $X86_X64, JOBS: $JOBS"
 if [ $ARM = YES ]; then
     (
         cd $work_dir && 
-        ./configure --arm --prefix=$INSTALL && make
+        ./configure --arm --jobs=$JOBS --prefix=$INSTALL --build-tag=${os_name}${os_major_version} && make
     ) >> $log 2>&1
 elif [ $MIPS = YES ]; then
     (
         cd $work_dir && 
-        ./configure --mips --prefix=$INSTALL && make
+        ./configure --mips --jobs=$JOBS --prefix=$INSTALL --build-tag=${os_name}${os_major_version} && make
     ) >> $log 2>&1
 elif [ $PI = YES ]; then
     (
         cd $work_dir && 
-        ./configure --pi --prefix=$INSTALL && make
+        ./configure --pi --jobs=$JOBS --prefix=$INSTALL --build-tag=${os_name}${os_major_version} && make
     ) >> $log 2>&1
 elif [ $X86_X64 = YES ]; then
     (
         cd $work_dir && 
-        ./configure --x86-x64 --prefix=$INSTALL && make
+        ./configure --x86-x64 --jobs=$JOBS --prefix=$INSTALL --build-tag=${os_name}${os_major_version} && make
     ) >> $log 2>&1
 else
     failed_msg "invalid option, must be --x86-x64/--arm/--mips/--pi, see --help"; exit 1;
@@ -147,6 +152,18 @@ ok_msg "start install srs"
 ) >> $log 2>&1
 ret=$?; if [[ 0 -ne ${ret} ]]; then failed_msg "install srs failed"; exit $ret; fi
 ok_msg "install srs success"
+
+# Copy srs-console
+HTTP_HOME="${package_dir}/${INSTALL}/objs/nginx/html/"
+(
+  cp $work_dir/research/api-server/static-dir/index.html ${HTTP_HOME} &&
+  cp $work_dir/research/api-server/static-dir/favicon.ico ${HTTP_HOME} &&
+  cp $work_dir/research/api-server/static-dir/crossdomain.xml ${HTTP_HOME} &&
+  cp -R $work_dir/research/players ${HTTP_HOME} &&
+  cp -R $work_dir/research/console ${HTTP_HOME}
+) >> $log 2>&1
+ret=$?; if [[ 0 -ne ${ret} ]]; then failed_msg "copy utilities failed"; exit $ret; fi
+ok_msg "copy utilities success"
 
 # copy extra files to package.
 ok_msg "start copy extra files to package"

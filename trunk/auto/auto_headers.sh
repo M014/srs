@@ -11,6 +11,7 @@ echo "#ifndef SRS_AUTO_HEADER_HPP" >> $SRS_AUTO_HEADERS_H
 echo "#define SRS_AUTO_HEADER_HPP" >> $SRS_AUTO_HEADERS_H
 echo "" >> $SRS_AUTO_HEADERS_H
 
+echo "#define SRS_AUTO_PACKAGER \"${SRS_AUTO_PACKAGER}\"" >> $SRS_AUTO_HEADERS_H
 echo "#define SRS_AUTO_BUILD_TS \"`date +%s`\"" >> $SRS_AUTO_HEADERS_H
 echo "#define SRS_AUTO_BUILD_DATE \"`date \"+%Y-%m-%d %H:%M:%S\"`\"" >> $SRS_AUTO_HEADERS_H
 echo "#define SRS_AUTO_UNAME \"`uname -a`\"" >> $SRS_AUTO_HEADERS_H
@@ -136,6 +137,11 @@ if [ $SRS_CROSS_BUILD = YES ]; then
     srs_define_macro "SRS_AUTO_CROSSBUILD" $SRS_AUTO_HEADERS_H
 else
     srs_undefine_macro "SRS_AUTO_CROSSBUILD" $SRS_AUTO_HEADERS_H
+fi
+if [ $SRS_OSX = YES ]; then
+    srs_define_macro "SRS_AUTO_OSX" $SRS_AUTO_HEADERS_H
+else
+    srs_undefine_macro "SRS_AUTO_OSX" $SRS_AUTO_HEADERS_H
 fi
 
 # prefix

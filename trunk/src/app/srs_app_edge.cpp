@@ -124,10 +124,15 @@ srs_error_t SrsEdgeRtmpUpstream::connect(SrsRequest* r, SrsLbRoundRobin* lb)
     if ((err = sdk->connect()) != srs_success) {
         return srs_error_wrap(err, "edge pull %s failed, cto=%dms, sto=%dms.", url.c_str(), srsu2msi(cto), srsu2msi(sto));
     }
-    
-    if ((err = sdk->play(_srs_config->get_chunk_size(req->vhost))) != srs_success) {
+
+    // For RTMP client, we pass the vhost in tcUrl when connecting,
+    // so we publish without vhost in stream.
+    string stream;
+    if ((err = sdk->play(_srs_config->get_chunk_size(req->vhost), false, &stream)) != srs_success) {
         return srs_error_wrap(err, "edge pull %s stream failed", url.c_str());
     }
+
+    srs_trace("edge-pull publish url %s, stream=%s%s as %s", url.c_str(), req->stream.c_str(), req->param.c_str(), stream.c_str());
     
     return err;
 }
@@ -234,15 +239,17 @@ srs_error_t SrsEdgeIngester::cycle()
     srs_error_t err = srs_success;
     
     while (true) {
+        // We always check status first.
+        // @see https://github.com/ossrs/srs/issues/1634#issuecomment-597571561
+        if ((err = trd->pull()) != srs_success) {
+            return srs_error_wrap(err, "edge ingester");
+        }
+
         if ((err = do_cycle()) != srs_success) {
             srs_warn("EdgeIngester: Ignore error, %s", srs_error_desc(err).c_str());
             srs_freep(err);
         }
-        
-        if ((err = trd->pull()) != srs_success) {
-            return srs_error_wrap(err, "edge ingester");
-        }
-        
+
         srs_usleep(SRS_EDGE_INGESTER_CIMS);
     }
     
@@ -314,7 +321,6 @@ srs_error_t SrsEdgeIngester::ingest(string& redirect)
     redirect = "";
     
     while (true) {
-        srs_error_t err = srs_success;
         if ((err = trd->pull()) != srs_success) {
             return srs_error_wrap(err, "thread quit");
         }
@@ -503,8 +509,11 @@ srs_error_t SrsEdgeForwarder::start()
     if ((err = sdk->connect()) != srs_success) {
         return srs_error_wrap(err, "sdk connect %s failed, cto=%dms, sto=%dms.", url.c_str(), srsu2msi(cto), srsu2msi(sto));
     }
-    
-    if ((err = sdk->publish(_srs_config->get_chunk_size(req->vhost))) != srs_success) {
+
+    // For RTMP client, we pass the vhost in tcUrl when connecting,
+    // so we publish without vhost in stream.
+    string stream;
+    if ((err = sdk->publish(_srs_config->get_chunk_size(req->vhost), false, &stream)) != srs_success) {
         return srs_error_wrap(err, "sdk publish");
     }
     
@@ -514,7 +523,8 @@ srs_error_t SrsEdgeForwarder::start()
     if ((err = trd->start()) != srs_success) {
         return srs_error_wrap(err, "coroutine");
     }
-    srs_trace("edge-fwr publish url %s", url.c_str());
+
+    srs_trace("edge-fwr publish url %s, stream=%s%s as %s", url.c_str(), req->stream.c_str(), req->param.c_str(), stream.c_str());
     
     return err;
 }
@@ -534,14 +544,16 @@ srs_error_t SrsEdgeForwarder::cycle()
     srs_error_t err = srs_success;
     
     while (true) {
-        if ((err = do_cycle()) != srs_success) {
-            return srs_error_wrap(err, "do cycle");
-        }
-        
+        // We always check status first.
+        // @see https://github.com/ossrs/srs/issues/1634#issuecomment-597571561
         if ((err = trd->pull()) != srs_success) {
             return srs_error_wrap(err, "thread pull");
         }
-    
+
+        if ((err = do_cycle()) != srs_success) {
+            return srs_error_wrap(err, "do cycle");
+        }
+
         srs_usleep(SRS_EDGE_FORWARDER_CIMS);
     }
     
@@ -687,11 +699,13 @@ void SrsPlayEdge::on_all_client_stop()
     // when all client disconnected,
     // and edge is ingesting origin stream, abort it.
     if (state == SrsEdgeStatePlay || state == SrsEdgeStateIngestConnected) {
-        ingester->stop();
-        
         SrsEdgeState pstate = state;
+        state = SrsEdgeStateIngestStopping;
+
+        ingester->stop();
+
         state = SrsEdgeStateInit;
-        srs_trace("edge change from %d to state %d (init).", pstate, state);
+        srs_trace("edge change from %d to %d then %d (init).", pstate, SrsEdgeStateIngestStopping, state);
         
         return;
     }

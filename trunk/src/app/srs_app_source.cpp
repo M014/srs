@@ -64,7 +64,7 @@ using namespace std;
 // the time to cleanup source.
 #define SRS_SOURCE_CLEANUP (30 * SRS_UTIME_SECONDS)
 
-int _srs_time_jitter_string2int(std::string time_jitter)
+int srs_time_jitter_string2int(std::string time_jitter)
 {
     if (time_jitter == "full") {
         return SrsRtmpJitterAlgorithmFULL;
@@ -515,7 +515,7 @@ srs_error_t SrsConsumer::dump_packets(SrsMessageArray* msgs, int& count)
     count = 0;
     
     if (should_update_source_id) {
-        srs_trace("update source_id=%d[%d]", source->source_id(), source->source_id());
+        srs_trace("update source_id=%d/%d", source->source_id(), source->pre_source_id());
         should_update_source_id = false;
     }
     
@@ -1506,6 +1506,7 @@ void SrsOriginHub::destroy_forwarders()
 SrsMetaCache::SrsMetaCache()
 {
     meta = video = audio = NULL;
+    previous_video = previous_audio = NULL;
     vformat = new SrsRtmpFormat();
     aformat = new SrsRtmpFormat();
 }
@@ -1516,6 +1517,13 @@ SrsMetaCache::~SrsMetaCache()
 }
 
 void SrsMetaCache::dispose()
+{
+    clear();
+    srs_freep(previous_video);
+    srs_freep(previous_audio);
+}
+
+void SrsMetaCache::clear()
 {
     srs_freep(meta);
     srs_freep(video);
@@ -1568,6 +1576,28 @@ srs_error_t SrsMetaCache::dumps(SrsConsumer* consumer, bool atc, SrsRtmpJitterAl
     }
     
     return err;
+}
+
+SrsSharedPtrMessage* SrsMetaCache::previous_vsh()
+{
+    return previous_video;
+}
+
+SrsSharedPtrMessage* SrsMetaCache::previous_ash()
+{
+    return previous_audio;
+}
+
+void SrsMetaCache::update_previous_vsh()
+{
+    srs_freep(previous_video);
+    previous_video = video? video->copy() : NULL;
+}
+
+void SrsMetaCache::update_previous_ash()
+{
+    srs_freep(previous_audio);
+    previous_audio = audio? audio->copy() : NULL;
 }
 
 srs_error_t SrsMetaCache::update_data(SrsMessageHeader* header, SrsOnMetaDataPacket* metadata, bool& updated)
@@ -1636,6 +1666,7 @@ srs_error_t SrsMetaCache::update_ash(SrsSharedPtrMessage* msg)
 {
     srs_freep(audio);
     audio = msg->copy();
+    update_previous_ash();
     return aformat->on_audio(msg);
 }
 
@@ -1643,6 +1674,7 @@ srs_error_t SrsMetaCache::update_vsh(SrsSharedPtrMessage* msg)
 {
     srs_freep(video);
     video = msg->copy();
+    update_previous_vsh();
     return vformat->on_video(msg);
 }
 
@@ -1792,7 +1824,7 @@ SrsSource::SrsSource()
     mix_queue = new SrsMixQueue();
     
     _can_publish = true;
-    _pre_source_id = _source_id = -1;
+    _pre_source_id = _source_id = 0;
     die_at = 0;
     
     play_edge = new SrsPlayEdge();
@@ -1990,13 +2022,10 @@ srs_error_t SrsSource::on_source_id_changed(int id)
     if (_source_id == id) {
         return err;
     }
-    
-    if (_pre_source_id == -1) {
+
+    if (!_pre_source_id) {
         _pre_source_id = id;
-    } else if (_pre_source_id != _source_id) {
-        _pre_source_id = _source_id;
     }
-    
     _source_id = id;
     
     // notice all consumer
@@ -2138,9 +2167,9 @@ srs_error_t SrsSource::on_audio_imp(SrsSharedPtrMessage* msg)
     
     // whether consumer should drop for the duplicated sequence header.
     bool drop_for_reduce = false;
-    if (is_sequence_header && meta->ash() && _srs_config->get_reduce_sequence_header(req->vhost)) {
-        if (meta->ash()->size == msg->size) {
-            drop_for_reduce = srs_bytes_equals(meta->ash()->payload, msg->payload, msg->size);
+    if (is_sequence_header && meta->previous_ash() && _srs_config->get_reduce_sequence_header(req->vhost)) {
+        if (meta->previous_ash()->size == msg->size) {
+            drop_for_reduce = srs_bytes_equals(meta->previous_ash()->payload, msg->payload, msg->size);
             srs_warn("drop for reduce sh audio, size=%d", msg->size);
         }
     }
@@ -2257,9 +2286,9 @@ srs_error_t SrsSource::on_video_imp(SrsSharedPtrMessage* msg)
     
     // whether consumer should drop for the duplicated sequence header.
     bool drop_for_reduce = false;
-    if (is_sequence_header && meta->vsh() && _srs_config->get_reduce_sequence_header(req->vhost)) {
-        if (meta->vsh()->size == msg->size) {
-            drop_for_reduce = srs_bytes_equals(meta->vsh()->payload, msg->payload, msg->size);
+    if (is_sequence_header && meta->previous_vsh() && _srs_config->get_reduce_sequence_header(req->vhost)) {
+        if (meta->previous_vsh()->size == msg->size) {
+            drop_for_reduce = srs_bytes_equals(meta->previous_vsh()->payload, msg->payload, msg->size);
             srs_warn("drop for reduce sh video, size=%d", msg->size);
         }
     }
@@ -2415,6 +2444,10 @@ srs_error_t SrsSource::on_publish()
     
     // reset the mix queue.
     mix_queue->clear();
+
+    // Reset the metadata cache, to make VLC happy when disable/enable stream.
+    // @see https://github.com/ossrs/srs/issues/1630#issuecomment-597979448
+    meta->clear();
     
     // detect the monotonically again.
     is_monotonically_increase = true;
@@ -2431,7 +2464,7 @@ srs_error_t SrsSource::on_publish()
         return srs_error_wrap(err, "handle publish");
     }
     SrsStatistic* stat = SrsStatistic::instance();
-    stat->on_stream_publish(req, _source_id);
+    stat->on_stream_publish(req, srs_int2str(_source_id));
     
     return err;
 }
@@ -2450,11 +2483,19 @@ void SrsSource::on_unpublish()
     // donot clear the sequence header, for it maybe not changed,
     // when drop dup sequence header, drop the metadata also.
     gop_cache->clear();
-    
+
+    // Reset the metadata cache, to make VLC happy when disable/enable stream.
+    // @see https://github.com/ossrs/srs/issues/1630#issuecomment-597979448
+    meta->update_previous_vsh();
+    meta->update_previous_ash();
+
     srs_trace("cleanup when unpublish");
     
     _can_publish = true;
-    _source_id = -1;
+    if (_source_id) {
+        _pre_source_id = _source_id;
+    }
+    _source_id = 0;
     
     // notify the handler.
     srs_assert(handler);
